@@ -29,6 +29,12 @@ declare namespace InternalFFIBinding {
   interface FunctionSignature {
     arguments?: readonly ValueType[];
     return?: ReturnType;
+    variadic?: boolean | readonly ValueType[];
+  }
+  interface CallbackSignature {
+    arguments?: readonly ValueType[];
+    return?: ReturnType;
+    variadic?: false;
   }
 
   class DynamicLibrary {
@@ -48,7 +54,7 @@ declare namespace InternalFFIBinding {
     getSymbols(): Record<string, bigint>;
     registerCallback(callback: FFICallback): bigint;
     registerCallback(
-      signature: FunctionSignature,
+      signature: CallbackSignature,
       callback: FFICallback
     ): bigint;
     unregisterCallback(pointer: bigint): void;

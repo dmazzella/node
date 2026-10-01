@@ -8,6 +8,65 @@ const test = require('node:test');
 const ffi = require('node:ffi');
 const { fixtureSymbols, libraryPath } = require('./ffi-test-common');
 
+test('ffi variadic functions retain their library across GC', async (t) => {
+  for (const variadic of [true, ['i32']]) {
+    let library = ffi.dlopen(libraryPath, {
+      variadic_sum_i32: {
+        arguments: ['i32'], return: 'i32', variadic,
+      },
+    });
+    const ref = new WeakRef(library.lib);
+    const fn = library.functions.variadic_sum_i32;
+    library = null;
+    try {
+      for (let index = 0; index < 5; index++) {
+        await gcUntil('ffi variadic function keeps library alive', () => true, 1);
+        t.assert.notStrictEqual(ref.deref(), undefined);
+        t.assert.strictEqual(fn(1, 42), 42);
+      }
+    } finally {
+      ref.deref()?.close();
+    }
+    t.assert.throws(() => fn(1, 42), { code: 'ERR_FFI_LIBRARY_CLOSED' });
+  }
+});
+
+test('ffi variadic function weak cache permits collection and recreation', async (t) => {
+  for (const variadic of [true, ['i32']]) {
+    const { lib } = ffi.dlopen(libraryPath);
+    try {
+      const signature = { arguments: ['i32'], return: 'i32', variadic };
+      let fn = lib.getFunction('variadic_sum_i32', signature);
+      const ref = new WeakRef(fn);
+      fn = null;
+      await gcUntil('ffi variadic function is collected', () => ref.deref() === undefined);
+      const replacement = lib.getFunction('variadic_sum_i32', signature);
+      t.assert.strictEqual(replacement(1, 42), 42);
+    } finally {
+      lib.close();
+    }
+  }
+});
+
+test('ffi failed callback signature parsing does not retain callbacks', async (t) => {
+  const { lib } = ffi.dlopen(libraryPath);
+  t.after(() => lib.close());
+  const failure = new Error('callback signature getter failed');
+  const types = ['i32'];
+  Object.defineProperty(types, 0, { get() { throw failure; } });
+  for (const signature of [
+    { arguments: ['i32'], get variadic() { throw failure; } },
+    { arguments: ['i32'], return: 'i32', variadic: types },
+  ]) {
+    let callback = () => 42;
+    const ref = new WeakRef(callback);
+    t.assert.throws(() => lib.registerCallback(signature, callback),
+                    (error) => error === failure);
+    callback = null;
+    await gcUntil('ffi failed registration releases callback', () => ref.deref() === undefined);
+  }
+});
+
 test('ffi unrefCallback releases callback function', async (t) => {
   const { lib, functions: symbols } = ffi.dlopen(libraryPath, fixtureSymbols);
   t.after(() => lib.close());

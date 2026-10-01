@@ -79,6 +79,61 @@ bool GetStrictUnsignedInteger(Local<Value> value, uint64_t max, uint64_t* out) {
   return true;
 }
 
+Maybe<ffi_type*> InferVariadicType(Environment* env,
+                                  unsigned int index,
+                                  Local<Value> value) {
+  if (value->IsNumber()) {
+    double number = value.As<Number>()->Value();
+    if (number == 0 && std::signbit(number)) {
+      return Just(&ffi_type_double);
+    }
+    return Just(value->IsInt32() ? &ffi_type_sint32 : &ffi_type_double);
+  }
+  if (value->IsBigInt()) {
+    return Just(&ffi_type_sint64);
+  }
+  if (value->IsNullOrUndefined() || value->IsString() ||
+      value->IsArrayBufferView() || value->IsArrayBuffer()) {
+    return Just(&ffi_type_pointer);
+  }
+  THROW_ERR_INVALID_ARG_TYPE(env, "Unsupported variadic argument %u", index);
+  return {};
+}
+
+ffi_type* PromoteVariadicType(ffi_type* type) {
+  static_assert(sizeof(int) == sizeof(int32_t));
+  if (type == &ffi_type_float) {
+    return &ffi_type_double;
+  }
+  if (type == &ffi_type_sint8 || type == &ffi_type_uint8 ||
+      type == &ffi_type_sint16 || type == &ffi_type_uint16) {
+    return &ffi_type_sint32;
+  }
+  return type;
+}
+
+Maybe<FFIArgumentCategory> ToPromotedFFIArgument(
+    Environment* env,
+    unsigned int index,
+    ffi_type* source_type,
+    ffi_type* promoted_type,
+    Local<Value> value,
+    void* result) {
+  if (source_type == promoted_type) {
+    return ToFFIArgument(env, index, source_type, value, result);
+  }
+  uint64_t source_storage = 0;
+  FFIArgumentCategory category;
+  if (!ToFFIArgument(env, index, source_type, value, &source_storage)
+           .To(&category)) {
+    return {};
+  }
+  CHECK(category == FFIArgumentCategory::Regular);
+  Local<Value> promoted_value =
+      ToJSArgument(env->isolate(), source_type, &source_storage);
+  return ToFFIArgument(env, index, promoted_type, promoted_value, result);
+}
+
 Maybe<FunctionSignature> ParseFunctionSignature(Environment* env,
                                                 std::string_view name,
                                                 Local<Object> signature) {
@@ -179,26 +234,85 @@ Maybe<FunctionSignature> ParseFunctionSignature(Environment* env,
     }
   }
 
-  return Just(FunctionSignature{return_type,
-                                std::move(args),
-                                std::move(return_type_name),
-                                std::move(arg_type_names)});
+  FunctionSignature parsed{return_type,
+                           std::move(args),
+                           std::move(return_type_name),
+                           std::move(arg_type_names)};
+  Local<String> variadic_key = FIXED_ONE_BYTE_STRING(isolate, "variadic");
+  bool has_variadic;
+  if (!signature->Has(context, variadic_key).To(&has_variadic)) {
+    return {};
+  }
+  if (has_variadic) {
+    Local<Value> variadic;
+    if (!signature->Get(context, variadic_key).ToLocal(&variadic)) {
+      return {};
+    }
+    if (variadic->IsTrue()) {
+      parsed.variadic_mode = VariadicMode::kAuto;
+    } else if (variadic->IsArray()) {
+      parsed.variadic_mode = VariadicMode::kExplicit;
+      Local<Array> types = variadic.As<Array>();
+      unsigned int count = types->Length();
+      if (count > UINT_MAX - parsed.args.size()) {
+        THROW_ERR_OUT_OF_RANGE(env, "Too many arguments for function %s", name);
+        return {};
+      }
+      parsed.variadic_args.reserve(count);
+      for (unsigned int index = 0; index < count; index++) {
+        Local<Value> entry;
+        if (!types->Get(context, index).ToLocal(&entry)) {
+          return {};
+        }
+        if (!entry->IsString()) {
+          THROW_ERR_INVALID_ARG_TYPE(
+              env, "Variadic argument %u of function %s must be a string",
+              index, name);
+          return {};
+        }
+        Utf8Value type_name(isolate, entry);
+        if (ThrowIfContainsNullBytes(
+                env,
+                type_name,
+                "Variadic argument " + std::to_string(index) +
+                    " of function " + std::string(name))) {
+          return {};
+        }
+        ffi_type* type;
+        if (!ToFFIType(env, type_name.ToStringView()).To(&type)) {
+          return {};
+        }
+        if (type == &ffi_type_void) {
+          THROW_ERR_INVALID_ARG_VALUE(
+              env, "Variadic argument %u of function %s must not be 'void'",
+              index, name);
+          return {};
+        }
+        parsed.variadic_args.push_back(type);
+      }
+    } else if (!variadic->IsFalse()) {
+      THROW_ERR_INVALID_ARG_TYPE(
+          env,
+          "Variadic signature of function %s must be a boolean or an array",
+          name);
+      return {};
+    }
+    if (parsed.variadic_mode != VariadicMode::kNone && parsed.args.empty()) {
+      THROW_ERR_INVALID_ARG_VALUE(
+          env, "Variadic function %s must have at least one fixed argument",
+          name);
+      return {};
+    }
+  }
+  return Just(std::move(parsed));
 }
 
 bool SignaturesMatch(const FFIFunction& fn,
-                     ffi_type* return_type,
-                     const std::vector<ffi_type*>& args) {
-  if (fn.return_type != return_type || fn.args.size() != args.size()) {
-    return false;
-  }
-
-  for (size_t i = 0; i < args.size(); i++) {
-    if (fn.args[i] != args[i]) {
-      return false;
-    }
-  }
-
-  return true;
+                     const FunctionSignature& signature) {
+  return fn.return_type == signature.return_type &&
+         fn.args == signature.args &&
+         fn.variadic_mode == signature.variadic_mode &&
+         fn.variadic_args == signature.variadic_args;
 }
 
 namespace {
@@ -234,6 +348,11 @@ bool IsBufferTypeName(const std::string& name) {
 bool IsFastCallEligible(const FFIFunction& fn, const char** out_reason) {
   static const char* dummy = "";
   if (out_reason == nullptr) out_reason = &dummy;
+
+  if (fn.variadic_mode != VariadicMode::kNone) {
+    *out_reason = "variadic signature";
+    return false;
+  }
 
     // Check that a platform stub emitter exists for the current ABI.
     // Stub emitters cover AArch64, x86_64 SysV, and Win64 x64. Other platforms
@@ -463,6 +582,7 @@ bool IsSBEligibleFFIType(ffi_type* type) {
 }
 
 bool IsSBEligibleSignature(const FFIFunction& fn) {
+  if (fn.variadic_mode != VariadicMode::kNone) return false;
   // The JS wrapper writes and reads the shared buffer little-endian while
   // the C++ side uses memcpy in host order. On big-endian hosts these
   // disagree, so the fast path is disabled there.

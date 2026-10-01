@@ -1,5 +1,7 @@
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
@@ -8,6 +10,157 @@
 #include <sys/mman.h>
 #define FFI_EXPORT
 #endif
+
+FFI_EXPORT int32_t variadic_sum_i32(int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  int32_t result = 0;
+  for (int32_t index = 0; index < count; index++) {
+    result += va_arg(arguments, int);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT double variadic_sum_f64(int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  double result = 0;
+  for (int32_t index = 0; index < count; index++) {
+    result += va_arg(arguments, double);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT double variadic_identity_f64(int32_t marker, ...) {
+  va_list arguments;
+  va_start(arguments, marker);
+  double result = va_arg(arguments, double);
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT int64_t variadic_sum_i64(int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  int64_t result = 0;
+  for (int32_t index = 0; index < count; index++) {
+    result += va_arg(arguments, int64_t);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT uint64_t variadic_sum_u64(int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  uint64_t result = 0;
+  for (int32_t index = 0; index < count; index++) {
+    result += va_arg(arguments, uint64_t);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT void* variadic_pointer(int32_t marker, ...) {
+  va_list arguments;
+  va_start(arguments, marker);
+  void* result = va_arg(arguments, void*);
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT uint64_t variadic_string_lengths(int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  uint64_t result = 0;
+  for (int32_t index = 0; index < count; index++) {
+    const char* value = va_arg(arguments, const char*);
+    result += strlen(value);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT double variadic_mixed(int32_t marker, ...) {
+  va_list arguments;
+  va_start(arguments, marker);
+  int number = va_arg(arguments, int);
+  double fraction = va_arg(arguments, double);
+  const char* text = va_arg(arguments, const char*);
+  const uint8_t* bytes = va_arg(arguments, const uint8_t*);
+  double result = marker + number + fraction + strlen(text) + bytes[0];
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT double variadic_mixed_many(double base,
+                                     const uint8_t* seed,
+                                     int32_t count,
+                                     ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  double result = base + seed[0];
+  for (int32_t index = 0; index < count; index++) {
+    int number = va_arg(arguments, int);
+    double fraction = va_arg(arguments, double);
+    const uint8_t* bytes = va_arg(arguments, const uint8_t*);
+    result += number + fraction + bytes[0];
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT uint32_t variadic_identity_u32(int32_t marker, ...) {
+  va_list arguments;
+  va_start(arguments, marker);
+  uint32_t result = va_arg(arguments, unsigned int);
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT double variadic_fixed_f32(float base, int32_t count, ...) {
+  va_list arguments;
+  va_start(arguments, count);
+  double result = base;
+  for (int32_t index = 0; index < count; index++) {
+    result += va_arg(arguments, double);
+  }
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT void variadic_write_i32(int32_t* target, ...) {
+  va_list arguments;
+  va_start(arguments, target);
+  *target = va_arg(arguments, int);
+  va_end(arguments);
+}
+
+FFI_EXPORT int32_t variadic_reenter(int32_t marker, ...) {
+  typedef int32_t (*VariadicCallback)(int32_t);
+  va_list arguments;
+  va_start(arguments, marker);
+  VariadicCallback callback = va_arg(arguments, VariadicCallback);
+  const char* text = va_arg(arguments, const char*);
+  int32_t callback_result = callback(marker);
+  int tail = va_arg(arguments, int);
+  int32_t result = marker + (int32_t)strlen(text) + callback_result + tail;
+  va_end(arguments);
+  return result;
+}
+
+FFI_EXPORT int32_t ffi_snprintf(char* output,
+                              size_t capacity,
+                              const char* format,
+                              ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  int result = vsnprintf(output, capacity, format, arguments);
+  va_end(arguments);
+  return result;
+}
 
 // Integer operations.
 

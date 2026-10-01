@@ -152,8 +152,6 @@ Maybe<DynamicLibrary::PreparedFunction> DynamicLibrary::PrepareFunction(
   // Look up the cache only after parsing: the signature's getters run user
   // code that may close the library, which clears `functions_`.
   auto existing = functions_.find(name);
-  auto [return_type, args, return_type_name, arg_type_names] =
-      std::move(parsed);
 
   bool should_cache_symbol = false;
   bool should_cache_function = false;
@@ -169,47 +167,51 @@ Maybe<DynamicLibrary::PreparedFunction> DynamicLibrary::PrepareFunction(
 
     fn = std::make_shared<FFIFunction>();
     fn->ptr = ptr;
-    fn->args = std::move(args);
-    fn->return_type = return_type;
-    fn->arg_type_names = std::move(arg_type_names);
-    fn->return_type_name = std::move(return_type_name);
+    fn->args = std::move(parsed.args);
+    fn->return_type = parsed.return_type;
+    fn->arg_type_names = std::move(parsed.arg_type_names);
+    fn->return_type_name = std::move(parsed.return_type_name);
+    fn->variadic_mode = parsed.variadic_mode;
+    fn->variadic_args = std::move(parsed.variadic_args);
 
-    ffi_status status = ffi_prep_cif(&fn->cif,
-                                     FFI_DEFAULT_ABI,
-                                     fn->args.size(),
-                                     fn->return_type,
-                                     fn->args.data());
-    if (status != FFI_OK) {
-      const char* msg = "ffi_prep_cif failed";
-      switch (status) {
-        case FFI_BAD_TYPEDEF:
-          msg = "ffi_prep_cif failed: bad typedef";
-          break;
-        case FFI_BAD_ABI:
-          msg = "ffi_prep_cif failed: bad ABI";
-          break;
-        default:
-          msg = "ffi_prep_cif failed: unknown error";
-          break;
+    if (fn->variadic_mode == VariadicMode::kNone) {
+      ffi_status status = ffi_prep_cif(&fn->cif,
+                                       FFI_DEFAULT_ABI,
+                                       fn->args.size(),
+                                       fn->return_type,
+                                       fn->args.data());
+      if (status != FFI_OK) {
+        const char* msg = "ffi_prep_cif failed";
+        switch (status) {
+          case FFI_BAD_TYPEDEF:
+            msg = "ffi_prep_cif failed: bad typedef";
+            break;
+          case FFI_BAD_ABI:
+            msg = "ffi_prep_cif failed: bad ABI";
+            break;
+          default:
+            msg = "ffi_prep_cif failed: unknown error";
+            break;
+        }
+
+        THROW_ERR_FFI_CALL_FAILED(env, msg);
+        return {};
       }
 
-      THROW_ERR_FFI_CALL_FAILED(env, msg);
-      return {};
-    }
-
 #if defined(NODE_FFI_HAS_FAST_CALL_PLAN)
-    // Allocation failure is non-fatal. Invoke() falls back to ffi_call().
-    ffi_call_plan* call_plan = ffi_call_plan_alloc(&fn->cif);
-    if (call_plan != nullptr) {
-      fn->call_plan.reset(call_plan);
-    }
+      // Allocation failure is non-fatal. Invoke() falls back to ffi_call().
+      ffi_call_plan* call_plan = ffi_call_plan_alloc(&fn->cif);
+      if (call_plan != nullptr) {
+        fn->call_plan.reset(call_plan);
+      }
 #endif
+    }
 
     should_cache_function = true;
   } else {
     fn = existing->second;
 
-    if (!SignaturesMatch(*fn, return_type, args)) {
+    if (!SignaturesMatch(*fn, parsed)) {
       THROW_ERR_INVALID_ARG_VALUE(
           env,
           "Function %s"
@@ -289,10 +291,13 @@ MaybeLocal<Function> DynamicLibrary::CreateFunction(
   // Try the generated Fast API path first. If metadata creation rejects the
   // signature, fall back to SharedBuffer for supported scalar shapes, then to
   // the generic libffi invoker.
-  std::shared_ptr<FFIFunction> fast_fn = CloneWithRawPointerArgNames(fn);
-  info->fast_metadata = CreateFastFFIMetadata(*fast_fn, &fn->closed, isolate);
+  bool is_variadic = fn->variadic_mode != VariadicMode::kNone;
+  if (!is_variadic) {
+    std::shared_ptr<FFIFunction> fast_fn = CloneWithRawPointerArgNames(fn);
+    info->fast_metadata = CreateFastFFIMetadata(*fast_fn, &fn->closed, isolate);
+  }
   bool use_fast_api = info->fast_metadata != nullptr;
-  bool use_sb = !use_fast_api && IsSBEligibleSignature(*fn);
+  bool use_sb = !is_variadic && !use_fast_api && IsSBEligibleSignature(*fn);
   bool has_ptr_args = use_sb && SignatureHasPointerArgs(*fn);
   // Signatures that need JS-side conversion or validation use a wrapper, as
   // do all fast signatures on platforms without a native library guard.
@@ -590,10 +595,23 @@ void DynamicLibrary::InvokeFunction(const FunctionCallbackInfo<Value>& args) {
   }
 
   // Convert arguments
-  unsigned int expected_args = fn->args.size();
+  unsigned int fixed_args = fn->args.size();
+  unsigned int expected_args = fixed_args;
   unsigned int provided_args = args.Length();
 
-  if (provided_args != expected_args) {
+  bool is_variadic = fn->variadic_mode != VariadicMode::kNone;
+  if (fn->variadic_mode == VariadicMode::kExplicit) {
+    expected_args += fn->variadic_args.size();
+  }
+  if (fn->variadic_mode == VariadicMode::kAuto &&
+      provided_args < expected_args) {
+    THROW_ERR_INVALID_ARG_VALUE(
+        env, "Invalid argument count: expected at least %u, got %u",
+        expected_args, provided_args);
+    return;
+  }
+  if (fn->variadic_mode != VariadicMode::kAuto &&
+      provided_args != expected_args) {
     THROW_ERR_INVALID_ARG_VALUE(env,
                                 "Invalid argument count: expected %s, got %s",
                                 expected_args,
@@ -601,14 +619,61 @@ void DynamicLibrary::InvokeFunction(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
-  std::vector<uint64_t> values(expected_args, 0);
-  std::vector<void*> ffi_args(expected_args, nullptr);
+  std::vector<ffi_type*> source_types;
+  std::vector<ffi_type*> promoted_types;
+  const std::vector<ffi_type*>* argument_types = &fn->args;
+  ffi_cif variadic_cif = {};
+  if (is_variadic) {
+    source_types = fn->args;
+    source_types.reserve(provided_args);
+    if (fn->variadic_mode == VariadicMode::kAuto) {
+      for (unsigned int index = fixed_args; index < provided_args; index++) {
+        ffi_type* type;
+        if (!InferVariadicType(env, index, args[index]).To(&type)) {
+          return;
+        }
+        source_types.push_back(type);
+      }
+    } else {
+      source_types.insert(source_types.end(),
+                          fn->variadic_args.begin(),
+                          fn->variadic_args.end());
+    }
+    promoted_types = source_types;
+    for (unsigned int index = fixed_args; index < provided_args; index++) {
+      promoted_types[index] = PromoteVariadicType(source_types[index]);
+    }
+    ffi_status status = ffi_prep_cif_var(&variadic_cif,
+                                       FFI_DEFAULT_ABI,
+                                       fixed_args,
+                                       provided_args,
+                                       fn->return_type,
+                                       promoted_types.data());
+    if (status != FFI_OK) {
+      THROW_ERR_FFI_CALL_FAILED(
+          env, "ffi_prep_cif_var failed: status %d", static_cast<int>(status));
+      return;
+    }
+    argument_types = &source_types;
+  }
+
+  std::vector<uint64_t> values(provided_args, 0);
+  std::vector<void*> ffi_args(provided_args, nullptr);
   std::vector<std::string> strings;
 
-  for (unsigned int i = 0; i < expected_args; i++) {
+  for (unsigned int i = 0; i < provided_args; i++) {
     FFIArgumentCategory res;
 
-    if (!ToFFIArgument(env, i, fn->args[i], args[i], &values[i]).To(&res)) {
+    Maybe<FFIArgumentCategory> converted =
+        is_variadic && i >= fixed_args ?
+            ToPromotedFFIArgument(env,
+                                  i,
+                                  source_types[i],
+                                  promoted_types[i],
+                                  args[i],
+                                  &values[i]) :
+            ToFFIArgument(env, i, (*argument_types)[i], args[i], &values[i]);
+    if (!converted.To(&res)) {
       return;
     }
 
@@ -627,7 +692,7 @@ void DynamicLibrary::InvokeFunction(const FunctionCallbackInfo<Value>& args) {
 
       if (strings.empty()) {
         // Keep string pointers stable as subsequent arguments are converted.
-        strings.reserve(expected_args);
+        strings.reserve(provided_args);
       }
       strings.push_back(*str);
       values[i] = reinterpret_cast<uint64_t>(strings.back().c_str());
@@ -643,7 +708,11 @@ void DynamicLibrary::InvokeFunction(const FunctionCallbackInfo<Value>& args) {
     result = Malloc(GetFFIReturnValueStorageSize(fn->return_type));
   }
 
-  fn->Invoke(result, ffi_args.data());
+  if (is_variadic) {
+    ffi_call(&variadic_cif, FFI_FN(fn->ptr), result, ffi_args.data());
+  } else {
+    fn->Invoke(result, ffi_args.data());
+  }
 
   // Return result back to Javascript
   ToJSReturnValue(env, args, fn->return_type, result);
@@ -1075,6 +1144,11 @@ void DynamicLibrary::RegisterCallback(const FunctionCallbackInfo<Value>& args) {
     FunctionSignature parsed;
     if (!ParseFunctionSignature(env, "<callback>", args[0].As<Object>())
              .To(&parsed)) {
+      return;
+    }
+
+    if (parsed.variadic_mode != VariadicMode::kNone) {
+      THROW_ERR_INVALID_ARG_VALUE(env, "Variadic callbacks are not supported");
       return;
     }
 

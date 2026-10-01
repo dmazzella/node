@@ -5,6 +5,7 @@
 #include "base_object.h"
 #include "ffi.h"
 #include "ffi/fast.h"
+#include "ffi/types.h"
 #include "uv.h"
 
 #include <cstdint>
@@ -42,6 +43,8 @@ struct FFIFunction {
   ffi_type* return_type = nullptr;
   std::vector<std::string> arg_type_names;
   std::string return_type_name;
+  VariadicMode variadic_mode = VariadicMode::kNone;
+  std::vector<ffi_type*> variadic_args;
 #if defined(NODE_FFI_HAS_FAST_CALL_PLAN)
   // The plan borrows cif, so it must remain uniquely owned by this instance.
   std::unique_ptr<ffi_call_plan, decltype(&ffi_call_plan_free)> call_plan{

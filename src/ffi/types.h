@@ -17,16 +17,30 @@ bool ThrowIfContainsNullBytes(Environment* env,
                               const Utf8Value& value,
                               std::string_view label);
 
+enum class VariadicMode {
+  kNone,
+  kAuto,
+  kExplicit,
+};
+
 struct FunctionSignature {
   ffi_type* return_type;
   std::vector<ffi_type*> args;
   std::string return_type_name;
   std::vector<std::string> arg_type_names;
+  VariadicMode variadic_mode = VariadicMode::kNone;
+  std::vector<ffi_type*> variadic_args;
 };
 v8::Maybe<FunctionSignature> ParseFunctionSignature(
     Environment* env, std::string_view name, v8::Local<v8::Object> signature);
 
 v8::Maybe<ffi_type*> ToFFIType(Environment* env, std::string_view type_str);
+
+v8::Maybe<ffi_type*> InferVariadicType(Environment* env,
+                                     unsigned int index,
+                                     v8::Local<v8::Value> value);
+
+ffi_type* PromoteVariadicType(ffi_type* type);
 
 enum class FFIArgumentCategory {
   Regular,
@@ -37,6 +51,14 @@ v8::Maybe<FFIArgumentCategory> ToFFIArgument(Environment* env,
                                              ffi_type* type,
                                              v8::Local<v8::Value> arg,
                                              void* ret);
+
+v8::Maybe<FFIArgumentCategory> ToPromotedFFIArgument(
+    Environment* env,
+    unsigned int index,
+    ffi_type* source_type,
+    ffi_type* promoted_type,
+    v8::Local<v8::Value> value,
+    void* result);
 
 v8::Local<v8::Value> ToJSArgument(v8::Isolate* isolate,
                                   ffi_type* type,
@@ -50,8 +72,7 @@ bool ToJSReturnValue(Environment* env,
 bool ToFFIReturnValue(v8::Local<v8::Value> result, ffi_type* type, void* ret);
 
 bool SignaturesMatch(const FFIFunction& fn,
-                     ffi_type* return_type,
-                     const std::vector<ffi_type*>& args);
+                     const FunctionSignature& signature);
 
 // Returns true if `fn` can be invoked via the V8 fast-call path. On
 // false, `*out_reason` is set to a static string describing why

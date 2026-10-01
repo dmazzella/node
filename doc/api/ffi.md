@@ -169,13 +169,17 @@ types exceed the limits for the current platform use one of the other
 
 Functions and callbacks are described with signature objects.
 
-Signature objects may contain the following properties, both of which are
-optional:
+Signature objects may contain the following optional properties:
 
 * `return` {string} A [type name][type names] specifying the return type of the
   function or callback. **Default:** `'void'`.
 * `arguments` {string\[]} An array of [type names][] specifying the argument
   type list of the function or callback. **Default:** `[]`.
+* `variadic` {boolean|string\[]} Declares a variadic native function. When
+  `true`, the types of arguments after the fixed `arguments` list are inferred
+  from each call's values. An array specifies the exact types of the variadic
+  arguments for every call. For callbacks, this property must be omitted or
+  `false`. **Default:** `false`.
 
 ```js
 const signature = {
@@ -183,6 +187,91 @@ const signature = {
   arguments: ['int32', 'int32'],
 };
 ```
+
+### Variadic Functions
+
+A variadic signature must declare at least one fixed argument in `arguments`.
+When `variadic` is `true`, a call must provide at least all fixed arguments.
+The remaining arguments are inferred as follows:
+
+* Numbers representable as `int32` are passed as `int32`.
+* Other numbers, including negative zero, `NaN`, and infinities, are passed as
+  `float64`.
+* BigInts are passed as `int64` and must fit its signed 64-bit range.
+* Strings, `Buffer` instances, typed arrays, `DataView` instances, `ArrayBuffer`
+  instances, `null`, and `undefined` are passed as pointers using the existing
+  pointer conversion rules.
+* Other values, including booleans and JavaScript functions, are rejected.
+
+When `variadic` is an array, a call must provide exactly the fixed arguments
+plus the declared variadic arguments. The variadic values are validated against
+their declared types before applying C's default argument promotions:
+`float32` becomes `float64`, and `char`, `bool`, `int8`, `uint8`, `int16`, and
+`uint16` become `int32`. A declared `float32` value is first rounded to float32.
+The types of fixed arguments are not promoted.
+
+An empty variadic tail is supported. `variadic: []` declares a variadic function
+whose calls have no additional arguments. Variadic functions use the generic
+libffi call path, not Fast FFI or SharedBuffer calls.
+
+The caller must know whether the C function is variadic and provide the correct
+signature. Argument inference does not inspect the C prototype or parse format
+strings. In particular, a JavaScript number such as `2` is inferred as `int32`,
+not as `float64`, and a BigInt is inferred as an integer, not as a pointer.
+Use explicit variadic types for integer-valued doubles, unsigned 64-bit
+integers, and raw pointer BigInts. An incorrect inferred or declared type can
+crash the process or corrupt memory.
+
+For example, `snprintf` has three fixed arguments:
+
+```c
+int snprintf(char* output, size_t capacity, const char* format, ...);
+```
+
+The following example uses a format matching the inferred variadic types:
+
+```cjs
+const ffi = require('node:ffi');
+
+const is32Bit = ['ia32', 'arm', 'mips', 'mipsel'].includes(process.arch);
+const sizeType = is32Bit ? 'uint32' : 'uint64';
+const libcPath = process.platform === 'win32' ? 'ucrtbase.dll' : null;
+const { lib, functions } = ffi.dlopen(libcPath, {
+  snprintf: {
+    arguments: ['buffer', sizeType, 'string'],
+    return: 'int32',
+    variadic: true,
+  },
+});
+
+try {
+  const output = Buffer.alloc(64);
+  const capacity = is32Bit ? output.length : BigInt(output.length);
+  const written = functions.snprintf(
+    output, capacity, '%d %.2f %s', 42, 1.25, 'ffi');
+  if (written < 0) {
+    throw new Error('snprintf failed');
+  }
+  if (written >= output.length) {
+    throw new Error('snprintf output was truncated');
+  }
+  console.log(output.toString('utf8', 0, written));
+} finally {
+  lib.close();
+}
+```
+
+On POSIX, this requires `snprintf` to be visible in the current process image;
+otherwise, load the appropriate C library explicitly. `size_t` must be mapped
+to the unsigned integer type matching the target's pointer width. The capacity
+must not exceed the actual destination buffer size. `snprintf` returns the
+required byte length excluding the terminating NUL, even when the output is
+truncated.
+
+To pass `2` to `%f`, use the explicit variadic type `float64` instead of
+inference. For the format above, the signature would use
+`variadic: ['int32', 'float64', 'string']`. Resolving the same symbol with a
+different signature in the same library instance remains unsupported.
 
 ## `ffi.suffix`
 
